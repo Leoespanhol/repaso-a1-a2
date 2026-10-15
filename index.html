@@ -238,20 +238,21 @@ select.answer{max-width:100%}
         <strong>Material de base</strong>
         <p>Adaptado a la secuencia didáctica de las unidades del libro <em>Experiencias Internacional A1–A2</em>, de Edelsa.</p>
         <p>ISBN: 978-84-9081-385-0 · Elaborado por Vasiliki Malliaros Ces · Editado con CANVA Pro.</p>
-        <p class="muted">Transformación a experiencia interactiva: LeoEspanhol. Se conserva el contenido del material de repaso y se incorporan campos interactivos, autocorrección cuando la respuesta es objetiva, guardado local y exportación de respuestas.</p>
+        <p class="muted">Transformación a experiencia interactiva: LeoEspanhol. Se conserva el contenido del material de repaso y se incorporan campos interactivos, autocorrección cuando la respuesta es objetiva, guardado del progreso en línea (vinculado a tu correo) y exportación de respuestas.</p>
       </div>
       <div class="student-meta">
         <div>
-          <label class="student-label" for="studentName">Nombre del alumno</label>
-          <input id="studentName" class="student-name" type="text" placeholder="Escribe tu nombre y apellido">
+          <label class="student-label" for="studentEmail">Correo del alumno</label>
+          <input id="studentEmail" class="student-name" type="email" inputmode="email" autocomplete="email" maxlength="190" placeholder="alumno@correo.com" aria-describedby="studentEmailStatus">
+          <p id="studentEmailStatus" class="student-help" aria-live="polite">Escribe tu correo para recuperar tus respuestas en cualquier dispositivo.</p>
         </div>
         <div>
-          <label class="student-label" for="studentEmail">Correo del alumno</label>
-          <input id="studentEmail" class="student-name" type="email" placeholder="alumno@correo.com">
+          <label class="student-label" for="studentName">Nombre del alumno</label>
+          <input id="studentName" class="student-name" type="text" autocomplete="name" maxlength="150" placeholder="Escribe tu nombre y apellido">
         </div>
         <div>
           <label class="student-label" for="studentTeacher">Profesor / grupo</label>
-          <input id="studentTeacher" class="student-name" type="text" placeholder="Ej.: Prof. Leonardo · A1–A2">
+          <input id="studentTeacher" class="student-name" type="text" maxlength="150" placeholder="Ej.: Prof. Leonardo · A1–A2">
         </div>
       </div>
       <div class="send-box">
@@ -773,10 +774,15 @@ Además, <select class="answer" name="u3e3_9" data-field="u3e3_9" data-answer="h
 <script>
 (() => {
   const KEY='leoespanhol_repaso_a1a2_v2';
+  const APOSTILA='repaso-a1-a2';
+  const REMOTE_SAVE_DELAY=3000;
+  const EMAIL_HINT='Escribe tu correo para recuperar tus respuestas en cualquier dispositivo.';
+  const OFFLINE_MSG='Sin conexión con el servidor: tu progreso se guarda solo en este dispositivo.';
   const SETTINGS={
     teacherEmail:'contato@leoespanhol.com.br',
     teacherName:'Profesor LeoEspanhol',
-    formspreeEndpoint:'https://formspree.io/f/xkjngbpr'
+    formspreeEndpoint:'https://formspree.io/f/xkjngbpr',
+    apiUrl:'api/progreso.php'
   };
   const screens=[...document.querySelectorAll('.intro-screen,.unit')];
   const fields=[...document.querySelectorAll('[data-field]')];
@@ -787,8 +793,17 @@ Además, <select class="answer" name="u3e3_9" data-field="u3e3_9" data-answer="h
   const sendStatus=document.getElementById('sendStatus');
   const floatingSaveBtn=document.getElementById('floatingSaveBtn');
   const floatingSaveLabel=document.getElementById('floatingSaveLabel');
+  const emailStatus=document.getElementById('studentEmailStatus');
   let toastTimer=null;
   let saveButtonTimer=null;
+  let remoteTimer=null;
+  // owner: correo dueño de las respuestas en pantalla · pending: cambios aún no enviados al servidor
+  let owner=null;
+  let pending=false;
+  let checkedEmail=null;
+  let editVersion=0;
+  let lookupSeq=0;
+  let pushChain=Promise.resolve();
 
   function say(msg){
     clearTimeout(toastTimer);
@@ -845,47 +860,205 @@ Además, <select class="answer" name="u3e3_9" data-field="u3e3_9" data-answer="h
     el.textContent='Revisa. Respuesta esperada: '+expected;
     return false;
   }
-  function save(notify=false){
-    const savedAt=new Date().toISOString();
-    const data={name:nameInput.value,email:emailInput?.value||'',teacher:teacherInput?.value||'',values:{},screen:currentScreen(),savedAt};
+  function timeNow(){
+    return new Date().toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'});
+  }
+  function formatDate(iso){
+    const d=new Date(iso);
+    if(isNaN(d)) return '';
+    return d.toLocaleString('es',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+  }
+  function normalizeEmail(v){
+    return String(v??'').trim().toLowerCase();
+  }
+  function isValidEmail(v){
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+  }
+  function currentEmail(){
+    return normalizeEmail(emailInput?.value);
+  }
+  function setEmailStatus(msg){
+    if(emailStatus) emailStatus.textContent=msg;
+  }
+  function hasAnswers(){
+    return fields.some(f=>String(f.value).trim());
+  }
+  function collectData(){
+    const data={name:nameInput.value,email:emailInput?.value||'',teacher:teacherInput?.value||'',values:{},screen:currentScreen(),savedAt:new Date().toISOString()};
     fields.forEach(f=>data.values[f.dataset.field]=f.value);
-    let ok=true;
-    try{localStorage.setItem(KEY,JSON.stringify(data));}catch(e){ok=false;}
+    return data;
+  }
+  function applyData(data){
+    nameInput.value=data.name||'';
+    if(teacherInput) teacherInput.value=data.teacher||'';
+    fields.forEach(f=>{
+      clearMark(f);
+      if(data.values && Object.prototype.hasOwnProperty.call(data.values,f.dataset.field)) f.value=data.values[f.dataset.field];
+    });
+  }
+  function writeLocal(){
+    try{localStorage.setItem(KEY,JSON.stringify({...collectData(),owner,pending}));return true;}catch(e){return false;}
+  }
+  function save(notify=false){
+    pending=true;
+    editVersion++;
+    const ok=writeLocal();
     updateStats();
-    if(notify){
-      clearTimeout(saveButtonTimer);
-      if(ok){
-        const when=new Date().toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'});
-        say('Progreso guardado en este dispositivo · '+when);
-        floatingSaveBtn?.classList.add('saved');
-        if(floatingSaveLabel) floatingSaveLabel.textContent='Guardado ✓';
-        saveButtonTimer=setTimeout(()=>{
-          floatingSaveBtn?.classList.remove('saved');
-          if(floatingSaveLabel) floatingSaveLabel.textContent='Guardar progreso';
-        },1800);
-      }else{
-        say('No fue posible guardar el progreso en este navegador.');
-      }
-    }
+    queueRemoteSave();
+    if(notify) notifySaved(ok);
     return ok;
+  }
+  async function notifySaved(localOk){
+    clearTimeout(saveButtonTimer);
+    const remoteOk=await pushAndReport();
+    if(!remoteOk && !localOk){
+      say('No fue posible guardar el progreso.');
+      return;
+    }
+    if(remoteOk) say('Progreso guardado en línea · '+timeNow());
+    else say('Progreso guardado solo en este dispositivo · '+timeNow()+(owner?'':'. Escribe tu correo para guardarlo en línea.'));
+    floatingSaveBtn?.classList.add('saved');
+    if(floatingSaveLabel) floatingSaveLabel.textContent='Guardado ✓';
+    saveButtonTimer=setTimeout(()=>{
+      floatingSaveBtn?.classList.remove('saved');
+      if(floatingSaveLabel) floatingSaveLabel.textContent='Guardar progreso';
+    },1800);
   }
   function restore(){
     try{
       const data=JSON.parse(localStorage.getItem(KEY)||'null');
       if(!data) return;
-      nameInput.value=data.name||'';
+      applyData(data);
       if(emailInput) emailInput.value=data.email||'';
-      if(teacherInput) teacherInput.value=data.teacher||'';
-      fields.forEach(f=>{ if(data.values && Object.prototype.hasOwnProperty.call(data.values,f.dataset.field)) f.value=data.values[f.dataset.field]; });
-      if(data.screen) show(data.screen,false);
+      // Datos guardados antes del guardado en línea no tienen owner/pending.
+      const legacyEmail=normalizeEmail(data.email);
+      owner='owner' in data ? data.owner : (isValidEmail(legacyEmail)?legacyEmail:null);
+      pending='pending' in data ? Boolean(data.pending) : true;
+      if(data.screen) show(data.screen,false,false);
     }catch(e){}
+  }
+
+  function queueRemoteSave(){
+    clearTimeout(remoteTimer);
+    remoteTimer=setTimeout(syncRemote,REMOTE_SAVE_DELAY);
+  }
+  async function syncRemote(){
+    const email=currentEmail();
+    if(isValidEmail(email) && email!==checkedEmail){
+      await lookupEmail();
+      return;
+    }
+    await pushAndReport();
+  }
+  async function sendProgress(keepalive=false){
+    if(!owner) return false;
+    if(!pending) return true;
+    const sentOwner=owner;
+    const sentVersion=editVersion;
+    const data=collectData();
+    try{
+      const res=await fetch(SETTINGS.apiUrl,{
+        method:'POST',
+        headers:{'Content-Type':'application/json','Accept':'application/json'},
+        keepalive,
+        body:JSON.stringify({email:sentOwner,apostila:APOSTILA,nombre:data.name,profesor:data.teacher,datos:{values:data.values,screen:data.screen,savedAt:data.savedAt}})
+      });
+      if(!res.ok) return false;
+      if(sentOwner===owner && sentVersion===editVersion){
+        pending=false;
+        writeLocal();
+      }
+      return true;
+    }catch(e){
+      return false;
+    }
+  }
+  // Envíos en fila: evita que una respuesta antigua llegue al servidor después de una más reciente.
+  function pushRemote(){
+    clearTimeout(remoteTimer);
+    pushChain=pushChain.then(()=>sendProgress());
+    return pushChain;
+  }
+  async function pushAndReport(){
+    const ok=await pushRemote();
+    if(owner) setEmailStatus(ok?'Progreso guardado en línea · '+timeNow():OFFLINE_MSG);
+    return ok;
+  }
+  function flushOnLeave(e){
+    if(e.type==='visibilitychange' && document.visibilityState!=='hidden') return;
+    if(!owner || !pending) return;
+    sendProgress(true);
+  }
+
+  async function lookupEmail(){
+    const email=currentEmail();
+    if(!email){ setEmailStatus(EMAIL_HINT); return; }
+    if(!isValidEmail(email)){ setEmailStatus('Revisa el correo: el formato no es válido.'); return; }
+    if(email===checkedEmail) return;
+    const seq=++lookupSeq;
+    setEmailStatus('Buscando tus respuestas…');
+    // Antes de cambiar de alumno, se envían los cambios pendientes del correo anterior.
+    if(owner && owner!==email && pending && !(await pushRemote())){
+      if(seq===lookupSeq) setEmailStatus(OFFLINE_MSG);
+      return;
+    }
+    let res,remote=null;
+    try{
+      res=await fetch(SETTINGS.apiUrl+'?apostila='+encodeURIComponent(APOSTILA)+'&email='+encodeURIComponent(email),{headers:{'Accept':'application/json'},cache:'no-store'});
+      if(res.ok) remote=await res.json();
+    }catch(e){
+      if(seq===lookupSeq) setEmailStatus(OFFLINE_MSG);
+      return;
+    }
+    if(seq!==lookupSeq || currentEmail()!==email) return;
+    if(res.status===404) startNewEmail(email);
+    else if(remote) loadRemote(email,remote);
+    else{ setEmailStatus(res.status===400?'Revisa el correo: el formato no es válido.':OFFLINE_MSG); return; }
+    checkedEmail=email;
+  }
+  function loadRemote(email,remote){
+    const keepLocal=(owner===email && pending)
+      || (!owner && hasAnswers() && !confirm('Encontramos respuestas guardadas en línea para este correo.\n\nAceptar: cargar las respuestas guardadas (se descartan las de esta pantalla).\nCancelar: conservar las de esta pantalla (reemplazan las guardadas en línea).'));
+    owner=email;
+    editVersion++;
+    if(keepLocal){
+      pending=true;
+      writeLocal();
+      pushAndReport();
+      return;
+    }
+    const datos=remote.datos||{};
+    applyData({name:remote.nombre,teacher:remote.profesor,values:datos.values});
+    resetUnitResults();
+    pending=false;
+    writeLocal();
+    updateStats();
+    const when=formatDate(datos.savedAt);
+    setEmailStatus('Respuestas recuperadas'+(when?' · última vez: '+when:'')+'.');
+    say('Respuestas recuperadas.');
+  }
+  function startNewEmail(email){
+    // Si la pantalla tiene respuestas de otro alumno (ordenador compartido), se empieza desde cero.
+    const otherStudent=Boolean(owner) && owner!==email && hasAnswers();
+    if(otherStudent){
+      fields.forEach(f=>{f.value='';clearMark(f);});
+      nameInput.value='';
+      resetUnitResults();
+    }
+    owner=email;
+    editVersion++;
+    pending=hasAnswers();
+    writeLocal();
+    updateStats();
+    setEmailStatus(otherStudent?'Correo nuevo: empiezas la apostilla desde cero. Tu progreso se guardará en línea.':'Correo nuevo: tu progreso se guardará en línea.');
+    if(pending) pushAndReport();
   }
   function currentScreen(){
     const active=document.querySelector('.intro-screen.active,.unit.active');
     if(!active) return 'intro';
     return active.classList.contains('intro-screen')?'intro':active.dataset.unit;
   }
-  function show(target,scroll=true){
+  function show(target,scroll=true,persist=true){
     target=String(target);
     screens.forEach(s=>s.classList.remove('active'));
     document.querySelectorAll('[data-nav]').forEach(b=>b.classList.remove('active'));
@@ -899,7 +1072,7 @@ Además, <select class="answer" name="u3e3_9" data-field="u3e3_9" data-answer="h
     }
     if(screen) screen.classList.add('active');
     if(scroll) window.scrollTo({top:0,behavior:'smooth'});
-    save();
+    if(persist) save();
   }
   function updateStats(){
     const total=fields.length;
@@ -937,14 +1110,20 @@ Además, <select class="answer" name="u3e3_9" data-field="u3e3_9" data-answer="h
     if(r) r.textContent='Aún no has corregido esta unidad.';
     save(); say('Respuestas de la Unidad '+n+' borradas.');
   }
+  function resetUnitResults(){
+    document.querySelectorAll('[data-unit-result]').forEach(r=>r.textContent='Aún no has corregido esta unidad.');
+  }
   function resetAll(){
-    if(!confirm('¿Quieres reiniciar toda la apostilla y borrar el progreso guardado?')) return;
+    if(!confirm('¿Quieres reiniciar la apostilla en este dispositivo? Las respuestas guardadas en línea se recuperan al escribir de nuevo tu correo.')) return;
     fields.forEach(f=>{f.value='';clearMark(f);});
     nameInput.value='';
     if(emailInput) emailInput.value='';
     if(teacherInput) teacherInput.value='';
     try{localStorage.removeItem(KEY);}catch(e){}
-    document.querySelectorAll('[data-unit-result]').forEach(r=>r.textContent='Aún no has corregido esta unidad.');
+    clearTimeout(remoteTimer);
+    owner=null; pending=false; checkedEmail=null;
+    resetUnitResults();
+    setEmailStatus(EMAIL_HINT);
     show('intro'); updateStats(); say('Progreso reiniciado.');
   }
   function getMeta(){
@@ -1005,6 +1184,7 @@ Además, <select class="answer" name="u3e3_9" data-field="u3e3_9" data-answer="h
       nameInput.focus();
       return;
     }
+    pushAndReport();
     setSendStatus('Preparando el envío al profesor...', 'info');
 
     if(SETTINGS.formspreeEndpoint){
@@ -1048,10 +1228,14 @@ Además, <select class="answer" name="u3e3_9" data-field="u3e3_9" data-answer="h
   [document.getElementById('sendBtnTop'),document.getElementById('sendBtnSide'),document.getElementById('sendBtnIntro')].filter(Boolean).forEach(b=>b.addEventListener('click',sendToTeacher));
   floatingSaveBtn?.addEventListener('click',()=>save(true));
   document.getElementById('resetBtn')?.addEventListener('click',resetAll);
+  emailInput?.addEventListener('change',lookupEmail);
+  document.addEventListener('visibilitychange',flushOnLeave);
+  window.addEventListener('pagehide',flushOnLeave);
 
   document.getElementById('intro').classList.add('active');
   restore();
   updateStats();
+  lookupEmail();
 })();
 </script>
 </body>
